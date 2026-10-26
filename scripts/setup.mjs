@@ -4,43 +4,61 @@ import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { ROOT, VENV_DIR, VENV_PYTHON, run } from './common.mjs';
 
-const MIN_PYTHON = [3, 10];
+// The pinned pandas / numpy versions publish Windows wheels for Python 3.10–3.13 only;
+// newer Pythons would try to compile them from source and fail.
+const SUPPORTED_MINORS = [12, 13, 11, 10];
+const INSTALL_HINT =
+  '   Install Python 3.12 from https://www.python.org/downloads/release/python-3128/\n' +
+  '   (it can sit alongside other Python versions), then run `npm run setup` again.\n' +
+  '   (Or set the PYTHON environment variable to a Python 3.12 executable.)\n';
+
+function pythonVersion(cmd, args = []) {
+  const result = spawnSync(cmd, [...args, '--version'], { encoding: 'utf8' });
+  const match = /Python (\d+)\.(\d+)/.exec(`${result.stdout}${result.stderr}`);
+  return result.status === 0 && match ? { major: Number(match[1]), minor: Number(match[2]) } : null;
+}
+
+const isSupported = (version) => version?.major === 3 && SUPPORTED_MINORS.includes(version.minor);
 
 function findPython() {
   const candidates = [
     ...(process.env.PYTHON ? [[process.env.PYTHON]] : []),
-    ...(process.platform === 'win32' ? [['py', '-3.12'], ['py', '-3']] : []),
+    ...(process.platform === 'win32' ? SUPPORTED_MINORS.map((minor) => ['py', `-3.${minor}`]) : []),
+    ...SUPPORTED_MINORS.map((minor) => [`python3.${minor}`]),
     ['python3'],
     ['python'],
   ];
+  const unsupported = new Set();
   for (const [cmd, ...args] of candidates) {
-    const result = spawnSync(cmd, [...args, '--version'], { encoding: 'utf8' });
-    const match = /Python (\d+)\.(\d+)/.exec(`${result.stdout}${result.stderr}`);
-    if (result.status === 0 && match) {
-      const [major, minor] = [Number(match[1]), Number(match[2])];
-      if (major > MIN_PYTHON[0] || (major === MIN_PYTHON[0] && minor >= MIN_PYTHON[1])) {
-        return { cmd, args, version: `${major}.${minor}` };
-      }
-    }
+    const version = pythonVersion(cmd, args);
+    if (!version) continue;
+    if (isSupported(version)) return { cmd, args, version: `3.${version.minor}` };
+    unsupported.add(`${version.major}.${version.minor}`);
   }
-  return null;
+  return { unsupported: [...unsupported] };
 }
 
-if (!existsSync(VENV_PYTHON)) {
-  const python = findPython();
-  if (!python) {
+if (existsSync(VENV_PYTHON)) {
+  const version = pythonVersion(VENV_PYTHON);
+  if (!isSupported(version)) {
     console.error(
-      `\n❌ Python ${MIN_PYTHON.join('.')}+ was not found.\n` +
-        '   Install Python 3.12 from https://www.python.org/downloads/ and tick\n' +
-        '   "Add python.exe to PATH" during install, then run `npm run setup` again.\n' +
-        '   (Or set the PYTHON environment variable to your python executable.)\n',
+      `\n❌ The existing .venv uses Python ${version ? `${version.major}.${version.minor}` : '(unknown)'}, ` +
+        'which this project does not support.\n   Delete the .venv folder and run `npm run setup` again.\n',
     );
+    process.exit(1);
+  }
+  console.log(`\n▶ Using existing virtual environment (${VENV_DIR})`);
+} else {
+  const python = findPython();
+  if (!python.cmd) {
+    const found = python.unsupported.length
+      ? `   Found Python ${python.unsupported.join(', ')}, which this project's packages do not support yet.\n`
+      : '';
+    console.error('\n❌ Python 3.10 – 3.13 was not found.\n' + found + INSTALL_HINT);
     process.exit(1);
   }
   console.log(`\n▶ Creating virtual environment with Python ${python.version} (${VENV_DIR})`);
   run(python.cmd, [...python.args, '-m', 'venv', VENV_DIR]);
-} else {
-  console.log(`\n▶ Using existing virtual environment (${VENV_DIR})`);
 }
 
 console.log('\n▶ Installing Python packages (requirements.txt)');

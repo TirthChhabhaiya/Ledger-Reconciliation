@@ -14,7 +14,9 @@ React + TypeScript frontend with a FastAPI backend, deployed on Vercel.
 
 ## Run locally
 
-Needs Python 3.12 (tick "Add python.exe to PATH" when installing) and Node.js 20+.
+Needs Node.js 20+ (https://nodejs.org, LTS) and Python 3.10 – 3.13; 3.12 recommended.
+Newer Python (3.14+) is not supported yet by the pinned pandas/numpy; 3.12 can be installed
+alongside it and `npm run setup` picks it automatically.
 
 After cloning, install everything once (creates `.venv`, installs `requirements.txt` into it,
 then runs `npm install`):
