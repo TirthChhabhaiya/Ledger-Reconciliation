@@ -1,0 +1,47 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Streamlit secrets (never commit)
+.streamlit/secrets.toml
+
+# Environment variables (.env.development holds no secrets and is committed)
+.env
+.env.local
+.env.*.local
+
+# Node / Vite frontend
+node_modules/
+dist/
+*.tsbuildinfo
+npm-debug.log*
+
+# Deployment tool folders
+.vercel/
+
+# Excel lock / temp files
+~$*.xlsx
+~$*.xls
+
+# Editor / OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

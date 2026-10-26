@@ -1,0 +1,3 @@
+# Original Streamlit app (python -m streamlit run app.py), same library versions as the backend.
+-r requirements.txt
+streamlit==1.41.1

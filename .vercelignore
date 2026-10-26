@@ -1,0 +1,7 @@
+.streamlit
+__pycache__
+.venv
+venv
+node_modules
+dist
+requirements-streamlit.txt
