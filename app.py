@@ -9,6 +9,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import PatternFill, Font, Alignment
+from highlight_export import build_highlighted_ledger
 
 # =========================================================
 # UNIVERSAL PARTY LEDGER READER v3
@@ -995,11 +996,34 @@ def _consolidate_balance_records(records):
     return 0.0, "", debit_total, credit_total
 
 
+def _latest_balance_records(records):
+    """Keep only the LATEST closing balance of every plant/section.
+
+    A multi-year ledger prints a closing balance at every year end (and the next
+    year opens with the same figure). Adding them all double counts
+    (e.g. 12,055 + 26,037 = 38,092), so only the last one counts.
+    """
+    by_section = {}
+    for rec in records or []:
+        by_section.setdefault(rec.get("plant_section") or "Unidentified Section", []).append(rec)
+    out = []
+    for recs in by_section.values():
+        dated = [(pd.to_datetime(r.get("date"), errors="coerce"), r) for r in recs]
+        valid = [d for d, _ in dated if not pd.isna(d)]
+        if not valid:
+            out.append(recs[-1])  # undated: the last one printed in the ledger
+            continue
+        latest = max(valid)
+        out.extend(r for d, r in dated if not pd.isna(d) and d == latest)
+    return out
+
+
 def _finalize_party_metadata(
     opening_records, closing_records, transactions, diagnostics=None, sections=None
 ):
+    latest_closing_records = _latest_balance_records(closing_records)
     opening_amount, opening_side, opening_dr, opening_cr = _consolidate_balance_records(opening_records)
-    closing_amount, closing_side, closing_dr, closing_cr = _consolidate_balance_records(closing_records)
+    closing_amount, closing_side, closing_dr, closing_cr = _consolidate_balance_records(latest_closing_records)
 
     def section_map(records):
         out = {}
@@ -1026,7 +1050,7 @@ def _finalize_party_metadata(
         }
     closing_by_section = {}
     for key in section_names:
-        recs = section_map(closing_records).get(key, [])
+        recs = section_map(latest_closing_records).get(key, [])
         amt, side, dr, cr = _consolidate_balance_records(recs)
         closing_by_section[key] = {
             "amount": amt, "side": side or "", "debit_total": dr, "credit_total": cr,
@@ -1160,8 +1184,11 @@ def _extract_pdf_section_and_balances(lines, page_number):
     section = _section_label_from_page(lines)
     for line in lines:
         x = re.sub(r"\s+", " ", line).strip()
-        if re.search(r"DURGA\s+INFRA.*\([^)]*\)", x, re.I):
-            section = x
+        m = re.search(r"DURGA\s+INFRA[^()]*\([^)]*\)", x, re.I)
+        if m:
+            # Only "Name (Plant)", not the "Ledger Account : dates Page 2" tail,
+            # otherwise every page looks like a different plant.
+            section = m.group(0).strip()
             break
     return section
 
@@ -1832,7 +1859,10 @@ def _normalize_party_dataframe(raw_df, source_name="Party Ledger"):
 
     df = raw_df.iloc[header_row + 1:].copy()
     df.columns = header_values
-    df = df.dropna(how="all").reset_index(drop=True)
+    df = df.dropna(how="all")
+    excel_rows = [int(i) + 1 for i in df.index]  # real Excel row numbers
+    df = df.reset_index(drop=True)
+    col_pos = {name: i + 1 for i, name in enumerate(df.columns)}
 
     date_col = _find_alias_column(df, PARTY_DATE_ALIASES)
     side_col = _find_alias_column(df, PARTY_SIDE_ALIASES)
@@ -1886,7 +1916,8 @@ def _normalize_party_dataframe(raw_df, source_name="Party Ledger"):
             tally_marker_count += 1
     tally_mode = tally_marker_count >= 2 and not sap_signed_amount_mode
 
-    for local_row, (_, row) in enumerate(df.iterrows(), start=header_row + 2):
+    for pos, (_, row) in enumerate(df.iterrows()):
+        local_row = excel_rows[pos]
         values = [_value_text(v) for v in row.tolist()]
         row_text = " | ".join(v for v in values if v)
         if not row_text:
@@ -2011,6 +2042,15 @@ def _normalize_party_dataframe(raw_df, source_name="Party Ledger"):
             )
             rec["Withholding Tax"] = float(party_wht)
             rec["Party Net Amount"] = float(amount)
+            if sap_signed_amount_mode:
+                hl_col = amount_col
+            elif side == "DR" and d > 0 and debit_col is not None:
+                hl_col = debit_col
+            elif side == "CR" and c > 0 and credit_col is not None:
+                hl_col = credit_col
+            else:
+                hl_col = amount_col
+            rec["Excel Col"] = col_pos.get(hl_col) if hl_col is not None else None
 
             if sap_signed_amount_mode and source_signed_amount is not None:
                 # Positive SAP amount = Debit, negative = Credit. When a WHT
@@ -2127,12 +2167,19 @@ def extract_party_metadata(party_file, party_pages=None, party_transactions=None
             text = re.sub(r"\s+", " ", line).strip()
             if not text:
                 continue
-            if re.search(r"LEDGER ACCOUNT|ACCOUNT|PAGE|DATE\s+PARTICULARS|FROM\s+\d", text, re.I):
+            if re.search(
+                r"\b(?:LEDGER|ACCOUNT|PAGE|DATE|PARTICULARS|CIN|GSTIN?|PAN|E-?MAIL|PHONE|MOBILE|TEL)\b"
+                r"|FROM\s+\d|^\d",
+                text, re.I,
+            ):
                 continue
-            if re.search(r"DURGA\s+INFRA|FLOW MATICS|AUTO CENTRE|MANIKANTA|SARGUJA", text, re.I):
-                party_name = _clean_party_name(text)
-                if party_name:
-                    break
+            # Our own company (the account name in the party's ledger) is never the party.
+            if re.search(r"DURGA\s+INFRA", text, re.I) or len(text) < 4:
+                continue
+            # First letterhead line of the Party ledger = the party's own name.
+            party_name = _clean_party_name(text)
+            if party_name:
+                break
         if not party_name:
             for line in str(party_pages[0].get("Text", "")).splitlines():
                 text = re.sub(r"\s+", " ", line).strip()
@@ -3096,7 +3143,9 @@ def _rebuild_reco_sheet_from_template(
         f"Closing Balance in my Books of Account ({my_books_fy_label}) "
         f"As At {my_books_date.strftime('%d/%m/%Y') if not pd.isna(my_books_date) else ''}"
     )
-    ws["F12"] = float(my_books_balance)
+    # Our closing balance goes in with the opposite sign (Excel or PDF ledger):
+    # negative in our books -> positive in F12, positive -> negative.
+    ws["F12"] = -float(my_books_balance)
     ws["F12"].number_format = "#,##0.00"
 
     starts = {
@@ -3386,108 +3435,79 @@ def generate_reconciliation_excel(selected_fy, unmatched_our, unmatched_party,
     return data
 
 
-def export_highlighted_ledgers_excel(our_match, party_match, matched, selected_fy):
-    """Export both selected-FY ledgers with matched transaction amount cells highlighted."""
-    from openpyxl import Workbook
-    from openpyxl.utils import get_column_letter
-    from openpyxl.styles import PatternFill, Font, Alignment
+def _matched_rows_for_export(our_match, party_match, matched, amount_tolerance):
+    """Rows of each ledger that were matched (used to decide what to highlight)."""
+    our_ids, party_ids = set(), set()
+    if matched is not None and not matched.empty:
+        for v in matched["Our Row"].astype(str):
+            our_ids.update(p.strip() for p in v.split(",") if p.strip())
+        pcol = "Party Rows" if "Party Rows" in matched.columns else "Party Row"
+        for v in matched[pcol].astype(str):
+            party_ids.update(p.strip() for p in v.split(",") if p.strip())
 
-    wb = Workbook()
-    ws_our = wb.active
-    ws_our.title = "Our Ledger"
-    ws_party = wb.create_sheet("Party Ledger")
+    our_rows = our_match[our_match["Our Row"].astype(str).isin(our_ids)].copy()
 
-    highlight = PatternFill(fill_type="solid", fgColor="C6EFCE")
-    highlight_font = Font(color="006100", bold=True)
-    header_fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
-    header_font = Font(bold=True)
+    # same numbering the matching engine used (reversals removed, index reset)
+    survivors = party_match.copy()
+    rev = _party_reversal_row_indexes(survivors, amount_tolerance)
+    if rev:
+        survivors = survivors[~survivors.index.isin(rev)]
+    survivors = survivors.reset_index(drop=True)
+    party_rows = survivors[survivors.index.astype(str).isin(party_ids)].copy()
+    return our_rows, party_rows
 
-    def write_sheet(ws, df, matched_rows, row_col, amount_candidates, internal_cols=()):
-        if df is None:
-            df = pd.DataFrame()
-        export_df = df.copy()
 
-        drop_cols = [c for c in internal_cols if c in export_df.columns]
-        export_df = export_df.drop(columns=drop_cols, errors="ignore")
+def render_highlighted_exports(our_match, party_match, matched, selected_fy, amount_tolerance):
+    """Button + download buttons: highlighted ORIGINAL ledgers (PDF -> PDF, Excel -> Excel)."""
+    st.subheader("🖍️ Highlighted Ledgers (same format as uploaded)")
+    st.caption("PDF → highlighted PDF. Excel → highlighted Excel (matched amount cells only).")
 
-        columns = list(export_df.columns)
-        for col_idx, col in enumerate(columns, 1):
-            cell = ws.cell(1, col_idx, str(col))
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center", vertical="center")
+    sig = (selected_fy, float(amount_tolerance), len(matched),
+           st.session_state.get("loaded_our_name"), st.session_state.get("loaded_party_name"))
 
-        matched_rows_normalized = {str(x) for x in matched_rows}
-        amount_col_idx = None
-        for candidate in amount_candidates:
-            for i, col in enumerate(columns, 1):
-                if str(col).strip().casefold() == str(candidate).strip().casefold():
-                    amount_col_idx = i
-                    break
-            if amount_col_idx:
-                break
-
-        for excel_row, (_, row) in enumerate(export_df.iterrows(), 2):
-            source_row = row.get(row_col, "")
-            is_matched = str(source_row) in matched_rows_normalized
-            for col_idx, col in enumerate(columns, 1):
-                value = row.get(col, "")
-                if pd.isna(value):
-                    value = ""
-                cell = ws.cell(excel_row, col_idx, value)
-                if is_matched and (amount_col_idx is None or col_idx == amount_col_idx):
-                    cell.fill = highlight
-                    cell.font = highlight_font
-
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions if ws.max_row > 1 else None
-        for col_idx in range(1, ws.max_column + 1):
-            letter = get_column_letter(col_idx)
-            max_len = 0
-            for cell in ws[letter]:
+    if st.button("🖍️ Generate Highlighted Ledgers", key="gen_highlight"):
+        our_rows, party_rows = _matched_rows_for_export(
+            our_match, party_match, matched, amount_tolerance)
+        our_df_raw = st.session_state.get("our_df")
+        header = (find_column(our_df_raw, ["Amount (CoCode Crcy)", "Amount",
+                                           "Amount (Company Code Currency)"])
+                  if our_df_raw is not None else None)
+        res = {"sig": sig}
+        with st.spinner("Highlighting original ledgers..."):
+            for kind, rows in (("our", our_rows), ("party", party_rows)):
                 try:
-                    max_len = max(max_len, len(str(cell.value)))
-                except Exception:
-                    pass
-            ws.column_dimensions[letter].width = min(max(max_len + 2, 10), 45)
+                    res[kind] = build_highlighted_ledger(
+                        kind,
+                        st.session_state[f"{kind}_file_bytes"],
+                        st.session_state[f"{kind}_file_name"],
+                        rows,
+                        sheet=st.session_state.get("our_sheet") if kind == "our" else None,
+                        amount_header=header if kind == "our" else None,
+                    )
+                except Exception as e:
+                    res[kind] = {"error": str(e)}
+        st.session_state["hl_results"] = res
 
-    # "Our Row" may be comma separated (netting matches) -> split it.
-    matched_our_rows = set()
-    matched_party_rows = set()
-    if not matched.empty:
-        for value in matched["Our Row"].astype(str):
-            matched_our_rows.update(x.strip() for x in value.split(",") if x.strip())
-        for value in matched["Party Rows"].astype(str):
-            matched_party_rows.update(x.strip() for x in value.split(",") if x.strip())
-
-    write_sheet(
-        ws_our,
-        our_match,
-        matched_our_rows,
-        "Our Row",
-        ["Match Amount", "Amount", "__amount"],
-        internal_cols=("__fy", "__date", "__amount", "__source_row", "Our Row")
-    )
-
-    write_sheet(
-        ws_party,
-        party_match,
-        matched_party_rows,
-        "Party Row",
-        ["Amount"],
-        internal_cols=("FY", "Party Row")
-    )
-
-    for ws in (ws_our, ws_party):
-        legend_row = ws.max_row + 2
-        ws.cell(legend_row, 1, "Green = matched transaction amount")
-        ws.cell(legend_row, 1).fill = highlight
-        ws.cell(legend_row, 1).font = highlight_font
-
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
-    return buffer.getvalue()
+    res = st.session_state.get("hl_results")
+    if res and res.get("sig") == sig:
+        fy = str(selected_fy).replace(" ", "_")
+        for kind, label in (("our", "Our_Ledger"), ("party", "Party_Ledger")):
+            out = res.get(kind, {})
+            if "error" in out:
+                st.warning(f"⚠️ {label}: {out['error']}")
+                continue
+            st.download_button(
+                f"📥 {label.replace('_', ' ')} — highlighted ({out['ext'].upper()[1:]})",
+                data=out["data"],
+                file_name=f"{label}_Highlighted_{fy}{out['ext']}",
+                mime=out["mime"],
+                key=f"dl_hl_{kind}",
+            )
+            msg = f"{label.replace('_', ' ')}: {out['highlighted']} amounts highlighted"
+            if out["missed"]:
+                st.warning(f"{msg}; {out['missed']} could not be located in the file.")
+            else:
+                st.caption(msg)
 
 
 def display_matching_engine(
@@ -3611,24 +3631,7 @@ def display_matching_engine(
         f"{len(unmatched_party):,} unmatched Party Ledger."
     )
 
-    # ---------------- Highlighted ledger export ----------------
-    try:
-        highlighted_ledger_bytes = export_highlighted_ledgers_excel(
-            our_match,
-            party_match,
-            matched,
-            selected_fy,
-        )
-        st.download_button(
-            "📥 Export Both Ledgers — Highlight Matched Amounts",
-            data=highlighted_ledger_bytes,
-            file_name=f"Highlighted_Ledgers_{selected_fy.replace(' ', '_')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-            help="Exports Our Ledger and Party Ledger for the selected FY. Matched transaction amount cells are highlighted in green.",
-        )
-    except Exception as e:
-        st.warning(f"⚠️ Highlighted ledger export is not available: {e}")
+    render_highlighted_exports(our_match, party_match, matched, selected_fy, amount_tolerance)
 
     # ---------------- Reconciliation format export ----------------
     st.session_state["reco_unmatched_our"] = unmatched_our.copy()
@@ -3890,6 +3893,10 @@ if st.button("▶️ READ LEDGERS", type="primary"):
             st.session_state["our_sheet"] = our_sheet
             st.session_state["loaded_our_name"] = our_file.name
             st.session_state["loaded_party_name"] = party_file.name
+            st.session_state["our_file_bytes"] = our_file.getvalue()
+            st.session_state["our_file_name"] = our_file.name
+            st.session_state["party_file_bytes"] = party_file.getvalue()
+            st.session_state["party_file_name"] = party_file.name
             st.session_state["party_name"] = party_name
             st.session_state["party_closing_date"] = party_closing_date
             st.session_state["party_closing_balance"] = party_closing_balance

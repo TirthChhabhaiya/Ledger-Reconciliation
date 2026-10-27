@@ -60,7 +60,7 @@ export default function App() {
   };
 
   // ---------------- Reruns ----------------
-  const rerun = async (next: Settings, read = false) => {
+  const rerun = async (next: Settings, read = false, clicked: string | null = null) => {
     // Without loaded ledgers a rerun always shows the start message (as in Streamlit).
     if (!read && !loaded) {
       setElements(START_MESSAGE);
@@ -84,6 +84,7 @@ export default function App() {
         amount_tolerance: next.amountTolerance,
         party_excel_from_our_books: next.fromOurBooks,
         selected_fy: next.selectedFy,
+        clicked,
       });
       if (seq !== runSeq.current) return;
 
@@ -203,6 +204,7 @@ export default function App() {
         <Elements
           elements={elements}
           onSelect={(key, value) => key === 'selected_fy' && changeSettings({ selectedFy: value })}
+          onClick={(key) => void rerun(settings, false, key)}
         />
       </section>
     </main>

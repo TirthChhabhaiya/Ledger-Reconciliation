@@ -7,7 +7,7 @@
   "functions": {
     "api/index.py": {
       "maxDuration": 300,
-      "includeFiles": "{app.py,RECO FORMAT.xlsx}"
+      "includeFiles": "{app.py,highlight_export.py,RECO FORMAT.xlsx}"
     },
     "api/blob-upload.ts": {
       "maxDuration": 30

@@ -17,6 +17,7 @@ export type UIElement =
   | { type: 'columns'; columns: UIElement[][] }
   | { type: 'expander'; label: string; children: UIElement[] }
   | { type: 'selectbox'; label: string; options: string[]; value: string | null; key: string }
+  | { type: 'button'; label: string; key: string }
   | {
       type: 'download_button';
       label: string;

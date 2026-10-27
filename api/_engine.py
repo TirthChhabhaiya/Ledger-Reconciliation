@@ -20,6 +20,10 @@ from pathlib import Path
 APP_PATH = Path(__file__).resolve().parent.parent / "app.py"
 UI_SECTION_MARKER = "\ndef display_matching_engine("
 
+# app.py imports highlight_export.py, which sits beside it.
+if str(APP_PATH.parent) not in sys.path:
+    sys.path.insert(0, str(APP_PATH.parent))
+
 _session_state = ContextVar("session_state")
 
 

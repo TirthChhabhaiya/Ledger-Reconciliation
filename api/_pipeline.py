@@ -38,7 +38,9 @@ build_our_matching_df = engine.build_our_matching_df
 match_transactions = engine.match_transactions
 _calculate_fy_withholding_tax = engine._calculate_fy_withholding_tax
 generate_reconciliation_excel = engine.generate_reconciliation_excel
-export_highlighted_ledgers_excel = engine.export_highlighted_ledgers_excel
+find_column = engine.find_column
+_matched_rows_for_export = engine._matched_rows_for_export
+build_highlighted_ledger = engine.build_highlighted_ledger
 
 BLOB_HOST_SUFFIX = ".blob.vercel-storage.com"
 
@@ -170,6 +172,10 @@ def _read_ledgers(our_file, party_file, ui):
         state["our_sheet"] = our_sheet
         state["loaded_our_name"] = our_file.name
         state["loaded_party_name"] = party_file.name
+        state["our_file_bytes"] = our_file.getvalue()
+        state["our_file_name"] = our_file.name
+        state["party_file_bytes"] = party_file.getvalue()
+        state["party_file_name"] = party_file.name
         state["party_name"] = party_name
         state["party_closing_date"] = party_closing_date
         state["party_closing_balance"] = party_closing_balance
@@ -220,6 +226,61 @@ def _read_ledgers_cached(our_source, party_source, from_our_books, session):
 
     elements, state = cached
     return copy.deepcopy(elements), copy.deepcopy(state)
+
+
+# =========================================================
+# HIGHLIGHTED LEDGERS
+# =========================================================
+def render_highlighted_exports(ui, session, our_match, party_match, matched, selected_fy, amount_tolerance):
+    """Button + download buttons: highlighted ORIGINAL ledgers (PDF -> PDF, Excel -> Excel)."""
+    ui.subheader("🖍️ Highlighted Ledgers (same format as uploaded)")
+    ui.caption("PDF → highlighted PDF. Excel → highlighted Excel (matched amount cells only).")
+
+    sig = (selected_fy, float(amount_tolerance), len(matched),
+           session.get("loaded_our_name"), session.get("loaded_party_name"))
+
+    if ui.button("🖍️ Generate Highlighted Ledgers", key="gen_highlight"):
+        our_rows, party_rows = _matched_rows_for_export(
+            our_match, party_match, matched, amount_tolerance)
+        our_df_raw = session.get("our_df")
+        header = (find_column(our_df_raw, ["Amount (CoCode Crcy)", "Amount",
+                                           "Amount (Company Code Currency)"])
+                  if our_df_raw is not None else None)
+        res = {"sig": sig}
+        for kind, rows in (("our", our_rows), ("party", party_rows)):
+            try:
+                res[kind] = build_highlighted_ledger(
+                    kind,
+                    session[f"{kind}_file_bytes"],
+                    session[f"{kind}_file_name"],
+                    rows,
+                    sheet=session.get("our_sheet") if kind == "our" else None,
+                    amount_header=header if kind == "our" else None,
+                )
+            except Exception as e:
+                res[kind] = {"error": str(e)}
+        session["hl_results"] = res
+
+    res = session.get("hl_results")
+    if res and res.get("sig") == sig:
+        fy = str(selected_fy).replace(" ", "_")
+        for kind, label in (("our", "Our_Ledger"), ("party", "Party_Ledger")):
+            out = res.get(kind, {})
+            if "error" in out:
+                ui.warning(f"⚠️ {label}: {out['error']}")
+                continue
+            ui.download_button(
+                f"📥 {label.replace('_', ' ')} — highlighted ({out['ext'].upper()[1:]})",
+                data=out["data"],
+                file_name=f"{label}_Highlighted_{fy}{out['ext']}",
+                mime=out["mime"],
+                key=f"dl_hl_{kind}",
+            )
+            msg = f"{label.replace('_', ' ')}: {out['highlighted']} amounts highlighted"
+            if out["missed"]:
+                ui.warning(f"{msg}; {out['missed']} could not be located in the file.")
+            else:
+                ui.caption(msg)
 
 
 # =========================================================
@@ -348,24 +409,7 @@ def display_matching_engine(
         f"{len(unmatched_party):,} unmatched Party Ledger."
     )
 
-    # ---------------- Highlighted ledger export ----------------
-    try:
-        highlighted_ledger_bytes = export_highlighted_ledgers_excel(
-            our_match,
-            party_match,
-            matched,
-            selected_fy,
-        )
-        ui.download_button(
-            "📥 Export Both Ledgers — Highlight Matched Amounts",
-            data=highlighted_ledger_bytes,
-            file_name=f"Highlighted_Ledgers_{selected_fy.replace(' ', '_')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-            help="Exports Our Ledger and Party Ledger for the selected FY. Matched transaction amount cells are highlighted in green.",
-        )
-    except Exception as e:
-        ui.warning(f"⚠️ Highlighted ledger export is not available: {e}")
+    render_highlighted_exports(ui, session, our_match, party_match, matched, selected_fy, amount_tolerance)
 
     # ---------------- Reconciliation format export ----------------
     session["reco_unmatched_our"] = unmatched_our.copy()
@@ -779,6 +823,7 @@ def run(params, inline_files):
       loaded                        files of the last successful READ LEDGERS, with
                                     party_excel_from_our_books as it was at that click
       date_tolerance, amount_tolerance, party_excel_from_our_books, selected_fy
+      clicked                       key of the button clicked on this run (st.button)
     """
     date_tolerance = int(params["date_tolerance"])
     amount_tolerance = float(params["amount_tolerance"])
@@ -789,7 +834,7 @@ def run(params, inline_files):
     session["amount_tolerance"] = float(amount_tolerance)
     use_session_state(session)
 
-    ui = UI()
+    ui = UI(clicked=params.get("clicked"))
     loaded = params.get("loaded")
     read = bool(params.get("read"))
     our_source = _file_source(params.get("our"), inline_files) if read else None

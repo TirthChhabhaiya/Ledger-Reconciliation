@@ -38,6 +38,7 @@ export interface RunRequest {
   amount_tolerance: number;
   party_excel_from_our_books: boolean;
   selected_fy: string | null;
+  clicked: string | null;
 }
 
 export async function runPage(request: RunRequest): Promise<RunResult> {
@@ -67,6 +68,7 @@ export async function runPage(request: RunRequest): Promise<RunResult> {
     amount_tolerance: request.amount_tolerance,
     party_excel_from_our_books: request.party_excel_from_our_books,
     selected_fy: request.selected_fy,
+    clicked: request.clicked,
   };
   form.append('params', JSON.stringify(params));
 

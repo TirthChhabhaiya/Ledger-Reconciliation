@@ -6,6 +6,7 @@ import { Markdown } from './Markdown';
 interface Props {
   elements: UIElement[];
   onSelect: (key: string, value: string) => void;
+  onClick: (key: string) => void;
 }
 
 function downloadBase64(data: string, fileName: string, mime: string) {
@@ -31,7 +32,7 @@ function Expander({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-export function Elements({ elements, onSelect }: Props) {
+export function Elements({ elements, onSelect, onClick }: Props) {
   return (
     <>
       {elements.map((el, i) => {
@@ -64,7 +65,7 @@ export function Elements({ elements, onSelect }: Props) {
               <div key={i} className="st-columns" style={{ gridTemplateColumns: `repeat(${el.columns.length}, minmax(0, 1fr))` }}>
                 {el.columns.map((column, c) => (
                   <div key={c} className="st-column">
-                    <Elements elements={column} onSelect={onSelect} />
+                    <Elements elements={column} onSelect={onSelect} onClick={onClick} />
                   </div>
                 ))}
               </div>
@@ -72,7 +73,7 @@ export function Elements({ elements, onSelect }: Props) {
           case 'expander':
             return (
               <Expander key={i} label={el.label}>
-                <Elements elements={el.children} onSelect={onSelect} />
+                <Elements elements={el.children} onSelect={onSelect} onClick={onClick} />
               </Expander>
             );
           case 'selectbox':
@@ -85,6 +86,14 @@ export function Elements({ elements, onSelect }: Props) {
                   ))}
                 </select>
               </label>
+            );
+          case 'button':
+            return (
+              <div key={i} className="download">
+                <button type="button" className="btn" onClick={() => onClick(el.key)}>
+                  {el.label}
+                </button>
+              </div>
             );
           case 'download_button':
             return (

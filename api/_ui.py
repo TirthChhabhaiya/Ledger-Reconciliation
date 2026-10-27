@@ -123,7 +123,12 @@ class Container:
         self._add({"type": "selectbox", "label": label, "options": list(options), "value": value, "key": key})
         return value
 
-    def download_button(self, label, data, file_name, mime, type="secondary", help=None):
+    def button(self, label, key):
+        """True only on the rerun the button was clicked (as in Streamlit)."""
+        self._add({"type": "button", "label": label, "key": key})
+        return key == self._ui.clicked
+
+    def download_button(self, label, data, file_name, mime, type="secondary", help=None, key=None):
         self._add({
             "type": "download_button",
             "label": label,
@@ -138,9 +143,10 @@ class Container:
 class UI(Container):
     """Root container; `with column:` blocks redirect output like Streamlit."""
 
-    def __init__(self):
+    def __init__(self, clicked=None):
         super().__init__(self, [])
         self._stack = [self]
+        self.clicked = clicked  # key of the button clicked on this rerun
 
     def _add(self, element):
         target = self._stack[-1]
