@@ -1,5 +1,8 @@
 # Backend (FastAPI on Vercel). Versions are pinned so local runs and Vercel give identical results.
 fastapi==0.115.6
+# FastAPI 0.115.6 needs Starlette < 0.42. Pinned so installing a newer package into .venv
+# (e.g. `pip install streamlit`, which pulls Starlette 1.x) is undone by `npm run setup`.
+starlette==0.41.3
 python-multipart==0.0.20
 uvicorn==0.32.1
 numpy==2.1.3
