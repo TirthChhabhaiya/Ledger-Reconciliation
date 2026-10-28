@@ -1193,6 +1193,71 @@ def _extract_pdf_section_and_balances(lines, page_number):
     return section
 
 
+_HEADER_COLUMN_LABELS = {
+    "DATE": "DATE", "TYPE": "TYPE", "VCH TYPE": "VCH TYPE", "VCH NO": "VCH NO",
+    "VOUCHER TYPE": "VCH TYPE", "VOUCHER NO": "VCH NO",
+    "PARTICULARS": "PARTICULARS", "PARTICULAR": "PARTICULARS", "NARRATION": "NARRATION",
+    "DEBIT": "DEBIT", "CREDIT": "CREDIT", "BALANCE": "BALANCE", "AMOUNT": "AMOUNT",
+}
+
+
+def _header_column_spans(header_line):
+    """Header columns as (label, x0, x1); "Vch" + "Type"/"No." become one column."""
+    spans = []
+    words = [w for w in header_line if str(w.get("text", "")).strip()]
+    i = 0
+    while i < len(words):
+        text = str(words[i].get("text", "")).strip().upper().rstrip(".:")
+        x0, x1 = float(words[i].get("x0", 0)), float(words[i].get("x1", 0))
+        if text in ("VCH", "VOUCHER") and i + 1 < len(words):
+            nxt = str(words[i + 1].get("text", "")).strip().upper().rstrip(".:")
+            if nxt in ("TYPE", "NO", "NUMBER"):
+                text = f"VCH {'TYPE' if nxt == 'TYPE' else 'NO'}"
+                x1 = float(words[i + 1].get("x1", x1))
+                i += 1
+        label = _HEADER_COLUMN_LABELS.get(text)
+        if label:
+            spans.append((label, x0, x1))
+        i += 1
+    return spans
+
+
+def _split_row_by_columns(line_words, skip_indexes, profile):
+    """Read Vch No. / Vch Type from their own header columns (works for all-digit
+    voucher numbers such as 170 or 5750052400143). Running-balance words are dropped.
+    Returns None when the header has no Vch No. column (old text-based logic applies)."""
+    columns = profile.get("columns") or []
+    if not any(label == "VCH NO" for label, _, _ in columns):
+        return None
+
+    def column_of(w):
+        # Under a header -> that column; otherwise the nearest header to its left
+        # (text columns are left-aligned, so "28%" stays in Particulars).
+        a, b = float(w.get("x0", 0)), float(w.get("x1", 0))
+        overlaps = [(min(b, x1) - max(a, x0), label) for label, x0, x1 in columns if min(b, x1) > max(a, x0)]
+        if overlaps:
+            return max(overlaps)[1]
+        left = [(x0, label) for label, x0, _ in columns if x0 <= a]
+        if left:
+            return max(left)[1]
+        return min(columns, key=lambda c: c[1] - b)[0]
+
+    desc, voucher, vtype = [], [], []
+    for j, w in enumerate(line_words):
+        t = str(w.get("text", "")).strip()
+        if j in skip_indexes or not t or _PARTY_DATE_RE.match(t):
+            continue
+        label = column_of(w)
+        if label == "VCH NO":
+            voucher.append(t)
+        elif label in ("VCH TYPE", "TYPE"):
+            vtype.append(t)
+        elif label in ("PARTICULARS", "NARRATION"):
+            desc.append(t)
+        # DATE / DEBIT / CREDIT / BALANCE / AMOUNT words are not description.
+    return " ".join(desc), " ".join(voucher), " ".join(vtype)
+
+
 def _infer_pdf_semantics(page, grouped_lines):
     """Infer PDF ledger semantics from geometry and repeated row evidence."""
     p = {
@@ -1263,6 +1328,8 @@ def _infer_pdf_semantics(page, grouped_lines):
             p["vch_type_x"] = x
         elif t in ("NO", "NO.", "NUMBER"):
             p["vch_no_x"] = x
+
+    p["columns"] = _header_column_spans(header_line)
 
     p["has_date"] = p["date_x"] is not None
     p["has_debit"] = p["debit_x"] is not None
@@ -1493,7 +1560,8 @@ def _infer_row_transaction_semantics(line_words, profile, current_date, marker_m
             continue
         body.append(t)
     raw_body = " ".join(body)
-    desc, voucher, vtype = _extract_voucher_and_type(raw_body)
+    by_columns = _split_row_by_columns(line_words, excluded, profile)
+    desc, voucher, vtype = by_columns if by_columns else _extract_voucher_and_type(raw_body)
     desc = re.sub(r"\s+", " ", str(desc or "")).strip(" -|:")
     return {
         "date": date_value, "side": side, "amount": chosen["amount"],
@@ -1610,7 +1678,8 @@ def _parse_pdf_page_universal(page, lines, plant_section, page_number, source_of
                         if not t or j == chosen["index"] or _PARTY_DATE_RE.match(t):
                             continue
                         body.append(t)
-                    desc, voucher, vtype = _extract_voucher_and_type(" ".join(body))
+                    by_columns = _split_row_by_columns(lw, {chosen["index"]}, profile)
+                    desc, voucher, vtype = by_columns if by_columns else _extract_voucher_and_type(" ".join(body))
                     info = {"date": row_date, "side": chosen["column"], "amount": chosen["amount"],
                             "marker": "", "description": _clean_transaction_text(desc),
                             "voucher": voucher, "vtype": vtype,
@@ -2926,13 +2995,22 @@ def _our_row_is_payment(row):
     return entry_type in ("KZ", "ZP") or "PAYMENT" in text or "(KZ" in text
 
 
+_NOT_A_DOCUMENT_RE = re.compile(
+    r"^[-(]?[\d,]+\.\d{1,2}\)?$"            # amounts / running balances: 93,169.83
+    r"|^\d{1,3}(?:,\d{2,3})+$"              # 3,81,920
+    r"|%$"                                  # GST rates: 18%
+    r"|^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}$"   # dates: 22-09-2025
+)
+
+
 def _party_document_numbers(vch_no, particulars):
-    """Document-like tokens (at least 4 characters with a digit) on the Party side."""
+    """Document-like tokens (with a digit; not amounts, rates or dates) on the Party side."""
     docs = []
     for part in [vch_no] + str(particulars or "").split():
         for piece in str(part or "").split(" | "):
+            piece = piece.strip()
             norm = normalize_voucher(piece)
-            if len(norm) >= 4 and re.search(r"\d", norm):
+            if norm and re.search(r"\d", norm) and not _NOT_A_DOCUMENT_RE.search(piece):
                 docs.append(norm)
     return docs
 
@@ -2962,14 +3040,19 @@ def verify_document_numbers(matched, our_df):
         our_docs.append(" | ".join(docs))
 
         party_docs = _party_document_numbers(m.get("Party Vch No.", ""), m.get("Party Particulars", ""))
-        norm_docs = [normalize_voucher(d) for d in docs if len(normalize_voucher(d)) >= 3]
+        norm_docs = [normalize_voucher(d) for d in docs if normalize_voucher(d)]
         same = lambda d, p: d == p or (len(d) >= 6 and d in p) or (len(p) >= 6 and p in d)
+        # A mismatch needs a real party invoice number: the Vch No. column, or a
+        # number of 3+ characters in Particulars (short ones like "4" only confirm).
+        party_has_doc = bool(normalize_voucher(m.get("Party Vch No.", ""))) or any(len(p) >= 3 for p in party_docs)
         if not norm_docs or not party_docs:
             checks.append(DOC_CHECK_SKIPPED)
         elif any(same(d, p) for d in norm_docs for p in party_docs):
             checks.append(DOC_CHECK_SAME)
-        else:
+        elif party_has_doc:
             checks.append(DOC_CHECK_MISMATCH)
+        else:
+            checks.append(DOC_CHECK_SKIPPED)
 
     result = matched.copy()
     at = list(result.columns).index("Match Type") + 1 if "Match Type" in result.columns else 0
