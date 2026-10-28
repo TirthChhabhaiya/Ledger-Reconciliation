@@ -5,6 +5,8 @@ interface Props {
   columns: string[];
   kinds: ColumnKind[];
   rows: CellValue[][];
+  /** Rows to highlight (e.g. invoice number mismatch). */
+  flagged?: (row: CellValue[]) => boolean;
 }
 
 function formatCell(value: CellValue, kind: ColumnKind): string {
@@ -29,7 +31,7 @@ function compare(a: CellValue, b: CellValue): number {
 }
 
 // Equivalent of st.dataframe(..., use_container_width=True, hide_index=True).
-export function DataTable({ columns, kinds, rows }: Props) {
+export function DataTable({ columns, kinds, rows, flagged }: Props) {
   const [sort, setSort] = useState<{ column: number; ascending: boolean } | null>(null);
 
   const sortedRows = useMemo(() => {
@@ -62,7 +64,7 @@ export function DataTable({ columns, kinds, rows }: Props) {
         </thead>
         <tbody>
           {sortedRows.map((row, r) => (
-            <tr key={r}>
+            <tr key={r} className={flagged?.(row) ? 'flagged' : undefined}>
               {row.map((value, c) => (
                 <td key={c} className={`${kinds[c] === 'number' ? 'num' : ''}${value === null ? ' null' : ''}`}>
                   {formatCell(value, kinds[c])}

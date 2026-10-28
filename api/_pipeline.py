@@ -341,6 +341,7 @@ def display_matching_engine(
         date_tolerance,
         amount_tolerance
     )
+    doc_mismatch = matched.attrs.get("doc_mismatch", pd.DataFrame())
 
     total_our = len(our_match)
     total_party = len(party_match)
@@ -371,6 +372,17 @@ def display_matching_engine(
     else:
         ui.warning("No transactions matched with the current tolerances.")
 
+    ui.subheader(f"⚠️ Invoice No. Mismatch ({len(doc_mismatch):,})")
+    if doc_mismatch.empty:
+        ui.success("Every matched invoice has the same invoice number on both sides.")
+    else:
+        ui.warning(
+            "Amount and date match, but the invoice number differs, so these entries "
+            "are kept unmatched and listed in the RECO statement. Check for an extra "
+            "party invoice or a wrong invoice number in our books."
+        )
+        ui.dataframe(doc_mismatch, use_container_width=True, hide_index=True)
+
     c1, c2 = ui.columns(2)
 
     with c1:
@@ -379,7 +391,7 @@ def display_matching_engine(
             ui.success("All Our Ledger transactions are matched.")
         else:
             cols = [
-                "__date", "Match Side", "Match Amount",
+                "Doc No. Check", "__date", "Match Side", "Match Amount",
                 "Our Description", "Our Row"
             ]
             ui.dataframe(
@@ -394,7 +406,7 @@ def display_matching_engine(
             ui.success("All Party Ledger transactions are matched.")
         else:
             cols = [
-                "Date", "Type", "Amount",
+                "Doc No. Check", "Date", "Type", "Amount",
                 "Particulars", "Vch Type", "Vch No."
             ]
             ui.dataframe(

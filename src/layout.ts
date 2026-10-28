@@ -212,7 +212,13 @@ export function buildPage(allElements: UIElement[]): PageModel {
           exporting = /Highlighted Ledgers/.test(el.body);
           tab = null;
           if (!exporting) {
-            const id = /Unmatched Our/.test(el.body) ? 'unmatched-our' : /Unmatched Party/.test(el.body) ? 'unmatched-party' : 'matched';
+            const id = /Unmatched Our/.test(el.body)
+              ? 'unmatched-our'
+              : /Unmatched Party/.test(el.body)
+                ? 'unmatched-party'
+                : /Invoice No\. Mismatch/.test(el.body)
+                  ? 'doc-mismatch'
+                  : 'matched';
             tab = { id, label: withoutCount(el.body), count: countIn(el.body), table: null, notes: [] };
             matchTabs.push(tab);
           }

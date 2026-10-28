@@ -273,7 +273,8 @@ export default function App() {
                     title="Transaction Results"
                     subtitle="View matched and unmatched transactions. Search to find specific entries."
                   >
-                    <ResultTabs tabs={page.tabs} />
+                    {/* Invoice no. mismatches show in the Unmatched tabs (and the stat card), not as a tab of their own. */}
+                    <ResultTabs tabs={page.tabs.filter((t) => t.id !== 'doc-mismatch')} />
                   </Step>
                 )}
 

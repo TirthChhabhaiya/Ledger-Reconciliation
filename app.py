@@ -2865,11 +2865,120 @@ def match_transactions(our_df, party_df, date_tolerance, amount_tolerance):
             "Confidence": "High" if ad == 0 and max_dd <= 1 else "Medium",
         })
 
+    # ---------- invoice number check ----------
+    # Amount/date matched but the invoice numbers differ (extra party invoice or a
+    # wrong invoice number in our books): both sides go back to unmatched, marked,
+    # so they appear in the RECO statement.
+    matched = verify_document_numbers(pd.DataFrame(matches), our)
+    our_notes, party_notes = {}, {}
+    mismatched = pd.DataFrame()
+    if not matched.empty:
+        is_mismatch = matched["Doc No. Check"].eq(DOC_CHECK_MISMATCH)
+        mismatched = matched[is_mismatch].reset_index(drop=True)
+        our_index = {str(v): i for i, v in our["Our Row"].items()}
+        for _, m in mismatched.iterrows():
+            party_doc = str(m.get("Party Vch No.", "") or "").strip()
+            our_doc = str(m.get("Our Doc No.", "") or "").strip()
+            for r in str(m["Our Row"]).split(","):
+                oi = our_index.get(r.strip())
+                if oi is not None:
+                    used_our.discard(oi)
+                    our_notes[oi] = f"{DOC_CHECK_MISMATCH} (party: {party_doc})"
+            for r in str(m["Party Rows"]).split(","):
+                if r.strip().isdigit():
+                    used_party.discard(int(r))
+                    party_notes[int(r)] = f"{DOC_CHECK_MISMATCH} (ours: {our_doc})"
+        matched = matched[~is_mismatch].reset_index(drop=True)
+
     # ---------- results ----------
-    matched = pd.DataFrame(matches)
     unmatched_our = our[~our.index.isin(used_our)].copy()
     unmatched_party = party[~party["Party Row"].astype(int).isin(used_party)].copy()
+    if our_notes:
+        unmatched_our.insert(0, "Doc No. Check", [our_notes.get(i, "") for i in unmatched_our.index])
+    if party_notes:
+        unmatched_party.insert(0, "Doc No. Check", [party_notes.get(int(i), "") for i in unmatched_party["Party Row"]])
+    matched.attrs["doc_mismatch"] = mismatched
     return matched, unmatched_our, unmatched_party
+
+
+DOC_CHECK_SAME = "✅ Same"
+DOC_CHECK_MISMATCH = "⚠️ Mismatch"
+DOC_CHECK_SKIPPED = "—"
+
+
+def _our_document_number(row):
+    """Invoice number on Our side.
+
+    SAP Excel: the Reference column (e.g. MEW/285/25-26).
+    SAP PDF:   the Vendor Document, i.e. the first token of the row
+               (e.g. 5750052401024 5100001971 Invoice - Gross (RE )).
+    """
+    if str(row.get("__ledger_source", "")) == "PDF":
+        tokens = str(row.get("Particulars", "") or "").split()
+        return tokens[0] if tokens and re.search(r"\d", tokens[0]) else ""
+    value = row.get("Reference", "")
+    return "" if value is None or pd.isna(value) else str(value).strip()
+
+
+def _our_row_is_payment(row):
+    entry_type = str(row.get("Journal Entry Type", "") or "").strip().upper()
+    text = f"{row.get('Particulars', '')} {row.get('Our Description', '')}".upper()
+    return entry_type in ("KZ", "ZP") or "PAYMENT" in text or "(KZ" in text
+
+
+def _party_document_numbers(vch_no, particulars):
+    """Document-like tokens (at least 4 characters with a digit) on the Party side."""
+    docs = []
+    for part in [vch_no] + str(particulars or "").split():
+        for piece in str(part or "").split(" | "):
+            norm = normalize_voucher(piece)
+            if len(norm) >= 4 and re.search(r"\d", norm):
+                docs.append(norm)
+    return docs
+
+
+def verify_document_numbers(matched, our_df):
+    """Second check on matched invoices: is the invoice number the same on both sides?
+
+    Adds two columns to the matched pairs:
+        Our Doc No.    - Our invoice number (Excel: Reference, PDF: Vendor Document)
+        Doc No. Check  - ✅ Same / ⚠️ Mismatch / — (payments, or no number on one side)
+    A mismatch means the amounts agree but the invoice numbers do not, e.g. the
+    party raised an extra invoice or an invoice number was booked wrongly;
+    match_transactions then moves both sides back to unmatched.
+    """
+    if matched is None or matched.empty:
+        return matched
+
+    our_rows = {}
+    if our_df is not None and not our_df.empty and "Our Row" in our_df.columns:
+        our_rows = {str(r["Our Row"]): r for _, r in our_df.iterrows()}
+
+    our_docs, checks = [], []
+    for _, m in matched.iterrows():
+        rows = [our_rows[r.strip()] for r in str(m.get("Our Row", "")).split(",") if r.strip() in our_rows]
+        invoices = [r for r in rows if not _our_row_is_payment(r)]
+        docs = [d for d in (_our_document_number(r) for r in invoices) if d]
+        our_docs.append(" | ".join(docs))
+
+        party_docs = _party_document_numbers(m.get("Party Vch No.", ""), m.get("Party Particulars", ""))
+        norm_docs = [normalize_voucher(d) for d in docs if len(normalize_voucher(d)) >= 3]
+        same = lambda d, p: d == p or (len(d) >= 6 and d in p) or (len(p) >= 6 and p in d)
+        if not norm_docs or not party_docs:
+            checks.append(DOC_CHECK_SKIPPED)
+        elif any(same(d, p) for d in norm_docs for p in party_docs):
+            checks.append(DOC_CHECK_SAME)
+        else:
+            checks.append(DOC_CHECK_MISMATCH)
+
+    result = matched.copy()
+    at = list(result.columns).index("Match Type") + 1 if "Match Type" in result.columns else 0
+    result.insert(at, "Doc No. Check", checks)
+    result.insert(at + 1, "Our Doc No.", our_docs)
+    # Show both invoice numbers side by side.
+    if "Party Vch No." in result.columns:
+        result.insert(at + 2, "Party Vch No.", result.pop("Party Vch No."))
+    return result
 
 
 def _reco_period(selected_fy):
@@ -3219,6 +3328,17 @@ def _rebuild_reco_sheet_from_template(
                 date_value = row.get("__date")
                 amount = amount_for_our(row)
 
+            # Invoice number mismatch (amount matched, invoice no. differs): say so and highlight.
+            doc_note = str(row.get("Doc No. Check", "") or "").strip()
+            if doc_note:
+                vch_no = str(row.get("Vch No.", "") or "").strip() if key in ("A", "B") else ""
+                note = doc_note.replace(DOC_CHECK_MISMATCH, "Invoice No. mismatch")
+                particulars = " ".join(x for x in (str(particulars or "").strip(), vch_no, f"- {note}") if x)
+                for col in (2, 3, 4):
+                    cell = ws.cell(r, col)
+                    cell.fill = PatternFill("solid", fgColor="E9D5FF")
+                    cell.font = Font(name=cell.font.name, size=cell.font.size, bold=True, color="5B21B6")
+
             date_parsed = pd.to_datetime(
                 date_value,
                 errors="coerce"
@@ -3563,6 +3683,7 @@ def display_matching_engine(
         date_tolerance,
         amount_tolerance
     )
+    doc_mismatch = matched.attrs.get("doc_mismatch", pd.DataFrame())
 
     total_our = len(our_match)
     total_party = len(party_match)
@@ -3593,6 +3714,17 @@ def display_matching_engine(
     else:
         st.warning("No transactions matched with the current tolerances.")
 
+    st.subheader(f"⚠️ Invoice No. Mismatch ({len(doc_mismatch):,})")
+    if doc_mismatch.empty:
+        st.success("Every matched invoice has the same invoice number on both sides.")
+    else:
+        st.warning(
+            "Amount and date match, but the invoice number differs, so these entries "
+            "are kept unmatched and listed in the RECO statement. Check for an extra "
+            "party invoice or a wrong invoice number in our books."
+        )
+        st.dataframe(doc_mismatch, use_container_width=True, hide_index=True)
+
     c1, c2 = st.columns(2)
 
     with c1:
@@ -3601,7 +3733,7 @@ def display_matching_engine(
             st.success("All Our Ledger transactions are matched.")
         else:
             cols = [
-                "__date", "Match Side", "Match Amount",
+                "Doc No. Check", "__date", "Match Side", "Match Amount",
                 "Our Description", "Our Row"
             ]
             st.dataframe(
@@ -3616,7 +3748,7 @@ def display_matching_engine(
             st.success("All Party Ledger transactions are matched.")
         else:
             cols = [
-                "Date", "Type", "Amount",
+                "Doc No. Check", "Date", "Type", "Amount",
                 "Particulars", "Vch Type", "Vch No."
             ]
             st.dataframe(

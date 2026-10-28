@@ -5,6 +5,7 @@ import {
   Download,
   FileSpreadsheet,
   FileText,
+  FileWarning,
   Highlighter,
   LoaderCircle,
   Percent,
@@ -13,7 +14,7 @@ import {
   TriangleAlert,
 } from 'lucide-react';
 import type { Balance, El, Exports, Matching, Metric, Summary, TableTab } from '../layout';
-import type { UIElement } from '../types';
+import type { CellValue, UIElement } from '../types';
 import { DataTable } from './DataTable';
 import { downloadBase64, Elements } from './Elements';
 import { Markdown } from './Markdown';
@@ -117,6 +118,7 @@ export function MatchingStats({ matching, tabs }: { matching: Matching; tabs: Ta
   const rate = metricValue(matching.metrics, 'Match Rate');
   const unmatchedOur = tabs.find((t) => t.id === 'unmatched-our')?.count;
   const unmatchedParty = tabs.find((t) => t.id === 'unmatched-party')?.count;
+  const docMismatch = tabs.find((t) => t.id === 'doc-mismatch')?.count;
   const share = (n: number | null | undefined, total: number) =>
     n != null && total > 0 ? `${((n / total) * 100).toFixed(1)}% of ${total.toLocaleString('en-IN')}` : '';
 
@@ -148,6 +150,16 @@ export function MatchingStats({ matching, tabs }: { matching: Matching; tabs: Ta
               <small>{share(unmatchedParty, party)}</small>
             </div>
           </div>
+          {docMismatch != null && (
+            <div className={`stat ${docMismatch > 0 ? 'purple' : 'green'}`}>
+              <FileWarning size={30} />
+              <div>
+                <span>Invoice no. mismatch</span>
+                <strong>{docMismatch.toLocaleString('en-IN')}</strong>
+                <small>Amount matches, invoice no. differs · in RECO</small>
+              </div>
+            </div>
+          )}
           <div className="stat blue">
             <Percent size={30} />
             <div>
@@ -180,6 +192,10 @@ export function ResultTabs({ tabs }: { tabs: TableTab[] }) {
 
   if (!tab) return null;
 
+  // Matched pairs whose invoice numbers differ are highlighted in every table that shows the check.
+  const checkColumn = tab.table?.columns.indexOf('Doc No. Check') ?? -1;
+  const flagged = (row: CellValue[]) => checkColumn >= 0 && String(row[checkColumn] ?? '').startsWith('⚠️');
+
   return (
     <div className="results">
       <div className="results-bar">
@@ -211,7 +227,7 @@ export function ResultTabs({ tabs }: { tabs: TableTab[] }) {
       <Notes elements={tab.notes} />
       {tab.table && (
         <>
-          <DataTable key={tab.id} columns={tab.table.columns} kinds={tab.table.kinds} rows={rows} />
+          <DataTable key={tab.id} columns={tab.table.columns} kinds={tab.table.kinds} rows={rows} flagged={flagged} />
           <div className="results-foot">
             Showing {rows.length.toLocaleString('en-IN')} of {tab.table.rows.length.toLocaleString('en-IN')} rows
           </div>

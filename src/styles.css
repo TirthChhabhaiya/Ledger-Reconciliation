@@ -676,7 +676,7 @@ h4 {
 /* ---------- 3. matching stats ---------- */
 .stat-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
   gap: 1rem;
   margin-bottom: 1rem;
 }
@@ -746,6 +746,15 @@ h4 {
 
 .stat.blue svg {
   color: var(--blue);
+}
+
+.stat.purple {
+  background: #f5f3ff;
+  border-color: #ddd6fe;
+}
+
+.stat.purple svg {
+  color: #7c3aed;
 }
 
 .progress {
@@ -1260,6 +1269,17 @@ select:focus,
 
 .dataframe tbody tr:hover td {
   background: #fff7ef;
+}
+
+/* Matched, but the invoice number differs on the two sides. */
+.dataframe tbody tr.flagged td {
+  background: #f5f3ff;
+  color: #5b21b6;
+  font-weight: 600;
+}
+
+.dataframe tbody tr.flagged td:first-child {
+  box-shadow: inset 3px 0 0 #7c3aed;
 }
 
 .dataframe .num {
