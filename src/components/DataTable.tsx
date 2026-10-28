@@ -7,8 +7,12 @@ interface Props {
   rows: CellValue[][];
 }
 
-function formatCell(value: CellValue): string {
-  if (value === null) return 'None';
+function formatCell(value: CellValue, kind: ColumnKind): string {
+  if (value === null) return '—';
+  if (kind === 'datetime' && typeof value === 'string') {
+    const m = value.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T]00:00:00)?$/);
+    if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  }
   if (typeof value === 'number') {
     return Number.isInteger(value) ? String(value) : Number(value.toFixed(4)).toString();
   }
@@ -61,7 +65,7 @@ export function DataTable({ columns, kinds, rows }: Props) {
             <tr key={r}>
               {row.map((value, c) => (
                 <td key={c} className={`${kinds[c] === 'number' ? 'num' : ''}${value === null ? ' null' : ''}`}>
-                  {formatCell(value)}
+                  {formatCell(value, kinds[c])}
                 </td>
               ))}
             </tr>

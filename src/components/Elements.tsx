@@ -9,7 +9,7 @@ interface Props {
   onClick: (key: string) => void;
 }
 
-function downloadBase64(data: string, fileName: string, mime: string) {
+export function downloadBase64(data: string, fileName: string, mime: string) {
   const bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
   const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
   const link = document.createElement('a');

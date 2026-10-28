@@ -41,7 +41,26 @@ export interface RunRequest {
   clicked: string | null;
 }
 
-export async function runPage(request: RunRequest): Promise<RunResult> {
+// XMLHttpRequest instead of fetch: only XHR reports upload progress of the request body.
+function postForm(form: FormData, onUploadProgress?: (percent: number) => void): Promise<RunResult> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/run');
+    xhr.responseType = 'json';
+    if (onUploadProgress) {
+      xhr.upload.onprogress = (e) => e.lengthComputable && onUploadProgress((e.loaded / e.total) * 100);
+      xhr.upload.onload = () => onUploadProgress(100);
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300 && xhr.response) resolve(xhr.response as RunResult);
+      else reject(new Error(xhr.response?.detail ?? `${xhr.status} ${xhr.statusText}`));
+    };
+    xhr.onerror = () => reject(new Error('Could not reach the server.'));
+    xhr.send(form);
+  });
+}
+
+export async function runPage(request: RunRequest, onUploadProgress?: (percent: number) => void): Promise<RunResult> {
   const form = new FormData();
 
   const ref = ({ file, url }: UploadedLedger, part: string): FileRef => {
@@ -72,15 +91,5 @@ export async function runPage(request: RunRequest): Promise<RunResult> {
   };
   form.append('params', JSON.stringify(params));
 
-  const response = await fetch('/api/run', { method: 'POST', body: form });
-  if (!response.ok) {
-    let detail = `${response.status} ${response.statusText}`;
-    try {
-      detail = (await response.json()).detail ?? detail;
-    } catch {
-      // keep the status text
-    }
-    throw new Error(detail);
-  }
-  return response.json();
+  return postForm(form, onUploadProgress);
 }
