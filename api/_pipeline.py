@@ -308,6 +308,10 @@ def display_matching_engine(
     ui.divider()
     ui.header(f"🔎 Transaction Matching Engine — {selected_fy}")
 
+    wrong_party = engine.ledger_party_mismatch(prepared_our, party_name)
+    if wrong_party:
+        ui.error(wrong_party)
+
     our_match = build_our_matching_df(prepared_our, selected_fy, amount_tolerance)
     party_match = party_df_all[
         party_df_all["FY"] == selected_fy
@@ -342,6 +346,15 @@ def display_matching_engine(
         amount_tolerance
     )
     doc_mismatch = matched.attrs.get("doc_mismatch", pd.DataFrame())
+
+    if "Date Unreadable" in party_match.columns:
+        unreadable = int(party_match["Date Unreadable"].fillna(False).astype(bool).sum())
+        if unreadable:
+            ui.warning(
+                f"⚠️ {unreadable:,} Party Ledger dates are drawn as pictures in the PDF and cannot be read. "
+                "Those entries are matched against any date between the readable dates before and after "
+                "them (column Date To). For exact dates, ask the party for an Excel or a text PDF export."
+            )
 
     total_our = len(our_match)
     total_party = len(party_match)
@@ -406,7 +419,7 @@ def display_matching_engine(
             ui.success("All Party Ledger transactions are matched.")
         else:
             cols = [
-                "Doc No. Check", "Date", "Type", "Amount",
+                "Doc No. Check", "Date", "Date To", "Type", "Amount",
                 "Particulars", "Vch Type", "Vch No."
             ]
             ui.dataframe(

@@ -1604,6 +1604,24 @@ def _parse_pdf_page_universal(page, lines, plant_section, page_number, source_of
     def clean_raw(lw):
         return re.sub(r"\s+", " ", " ".join(str(w.get("text", "")).strip() for w in lw)).strip()
 
+    # Some PDFs draw the dates as vector shapes instead of text. Small shapes in the
+    # Date column of a row without date text mean "a date is there but unreadable".
+    date_span = next((c for c in profile.get("columns", []) if c[0] == "DATE"), None)
+    drawn_in_date_column = []
+    if date_span is not None:
+        try:
+            for c in page.curves:
+                x0, x1, top, bottom = (float(c[k]) for k in ("x0", "x1", "top", "bottom"))
+                if x1 <= date_span[2] + 4 and x0 >= date_span[1] - 40 and x1 - x0 < 15 and bottom - top < 15:
+                    drawn_in_date_column.append((top, bottom))
+        except Exception:
+            drawn_in_date_column = []
+
+    def date_is_drawn(lw):
+        top = min(float(w.get("top", 0)) for w in lw)
+        bottom = max(float(w.get("bottom", 0)) for w in lw)
+        return any(t < bottom and b > top for t, b in drawn_in_date_column)
+
     for idx in range(h + 1, len(grouped)):
         lw = grouped[idx]
         raw = clean_raw(lw)
@@ -1617,6 +1635,7 @@ def _parse_pdf_page_universal(page, lines, plant_section, page_number, source_of
             continue
 
         row_date = current_date
+        has_date_text = any(_PARTY_DATE_RE.match(str(w.get("text", "")).strip()) for w in lw)
         for w in lw:
             t = str(w.get("text", "")).strip()
             if _PARTY_DATE_RE.match(t):
@@ -1718,6 +1737,8 @@ def _parse_pdf_page_universal(page, lines, plant_section, page_number, source_of
                                  plant_section, page_number, source_offset + idx, "UNIVERSAL_SEMANTIC")
         if rec:
             rec["Row Type"] = "TRANSACTION"
+            rec["Date Text"] = bool(has_date_text)
+            rec["Date Unreadable"] = bool(not has_date_text and drawn_in_date_column and date_is_drawn(lw))
             results.append(rec)
         else:
             unparsed += 1
@@ -1816,6 +1837,31 @@ def _infer_implicit_closing_rows(page_txns, page_text, page_number, plant_sectio
     return out, [closing]
 
 
+def _set_unreadable_date_windows(transactions):
+    """A row whose date is drawn (not text) keeps the last readable date as "Date"
+    and gets "Date To" = the next readable date: its real date lies in between.
+    Without a next readable date the window runs to the end of that FY."""
+    # A row with a blank date shares the date of the row above it, so when that
+    # date is unreadable, so is this one.
+    for prev, rec in zip(transactions, transactions[1:]):
+        if prev.get("Date Unreadable") and "Date Text" in rec and not rec.get("Date Text"):
+            rec["Date Unreadable"] = True
+
+    for i, rec in enumerate(transactions):
+        if not rec.get("Date Unreadable"):
+            continue
+        lo = pd.to_datetime(rec.get("Date"), errors="coerce")
+        hi = pd.NaT
+        for nxt in transactions[i + 1:]:
+            d = pd.to_datetime(nxt.get("Date"), errors="coerce")
+            if nxt.get("Date Text") and not pd.isna(d) and (pd.isna(lo) or d >= lo):
+                hi = d
+                break
+        if pd.isna(hi) and not pd.isna(lo):
+            hi = pd.Timestamp(year=lo.year + (1 if lo.month >= 4 else 0), month=3, day=31)
+        rec["Date To"] = hi
+
+
 def extract_party_pdf_transactions(uploaded_file):
     """Universal PDF normalizer."""
     uploaded_file.seek(0)
@@ -1871,6 +1917,7 @@ def extract_party_pdf_transactions(uploaded_file):
             })
 
     transactions = _dedupe_party_transactions(transactions)
+    _set_unreadable_date_windows(transactions)
     dates = pd.to_datetime([x.get("Date") for x in transactions], errors="coerce").dropna()
     last_date = dates.max() if not dates.empty else pd.NaT
 
@@ -2602,6 +2649,9 @@ def _party_reversal_row_indexes(df, amount_tolerance=1.0):
         return set()
     if "Date" not in df.columns or "Type" not in df.columns:
         return set()
+    if "Date Unreadable" in df.columns:
+        # Unreadable dates are only estimates: never treat them as same-date reversals.
+        df = df[~df["Date Unreadable"].fillna(False).astype(bool)]
 
     return _pair_opposite_reversal_indexes(
         df,
@@ -2725,6 +2775,15 @@ def match_transactions(our_df, party_df, date_tolerance, amount_tolerance):
             return 999999
         return abs((a - b).days)
 
+    def party_date_diff(our_date, p):
+        # Unreadable party date: any day between "Date" and "Date To" is a hit.
+        if str(p.get("Date Unreadable")) == "True":
+            lo, hi = pd.to_datetime(p.get("Date"), errors="coerce"), pd.to_datetime(p.get("Date To"), errors="coerce")
+            od = pd.to_datetime(our_date, errors="coerce")
+            if not (pd.isna(lo) or pd.isna(hi) or pd.isna(od)):
+                return 0 if lo <= od <= hi else min(date_diff(od, lo), date_diff(od, hi))
+        return date_diff(our_date, p.get("Date"))
+
     def voucher_hit(o, p):
         pv = normalize_voucher(p.get("Vch No.", ""))
         if not pv:
@@ -2758,7 +2817,7 @@ def match_transactions(our_df, party_df, date_tolerance, amount_tolerance):
             ad = abs(our_amt - p_amt)
             if ad > amount_tolerance:
                 continue
-            dd = date_diff(our_date, p.get("Date"))
+            dd = party_date_diff(our_date, p)
             if dd > date_tolerance:
                 continue
             sim = text_similarity(o.get("Our Description", ""), p.get("Particulars", ""))
@@ -2801,7 +2860,7 @@ def match_transactions(our_df, party_df, date_tolerance, amount_tolerance):
             p_amt = party_amount(p)
             if p_amt <= 0 or p_amt > our_amt + amount_tolerance:
                 continue
-            dd = date_diff(our_date, p.get("Date"))
+            dd = party_date_diff(our_date, p)
             if dd <= date_tolerance:
                 pool.append((pi, p_amt, dd))
         pool.sort(key=lambda x: (x[2], -x[1]))
@@ -2872,7 +2931,7 @@ def match_transactions(our_df, party_df, date_tolerance, amount_tolerance):
         for oi, o in our.iterrows():
             if oi in used_our:
                 continue
-            dd = date_diff(o.get("__date"), p_date)
+            dd = party_date_diff(o.get("__date"), p)
             if dd > date_tolerance:
                 continue
             signed = float(o.get("Match Amount", 0) or 0)
@@ -3062,6 +3121,33 @@ def verify_document_numbers(matched, our_df):
     if "Party Vch No." in result.columns:
         result.insert(at + 2, "Party Vch No.", result.pop("Party Vch No."))
     return result
+
+
+_NAME_NOISE = {"PVT", "PRIVATE", "LTD", "LIMITED", "LLP", "CO", "COMPANY", "THE", "AND",
+               "M", "S", "MS", "INDUSTRIES", "ENTERPRISES", "TRADERS", "INDIA"}
+
+
+def ledger_party_mismatch(prepared_our, party_name):
+    """Warn when the SAP ledger's Supplier Name and the Party Ledger's name share no
+    real word (e.g. an EXIDE SAP export uploaded with a BANSAL party PDF)."""
+    if prepared_our is None or prepared_our.empty:
+        return None
+    col = find_column(prepared_our, ["Supplier Name", "Vendor Name"])
+    party = clean_text(party_name)
+    if col is None or not party or party == "PARTY LEDGER":
+        return None
+    suppliers = [s for s in prepared_our[col].dropna().astype(str).str.strip().unique() if s and s != col]
+    if not suppliers:
+        return None
+    party_words = {w for w in party.split() if len(w) >= 3 and w not in _NAME_NOISE}
+    for s in suppliers:
+        words = {w for w in clean_text(s).split() if len(w) >= 3 and w not in _NAME_NOISE}
+        if party_words & words or text_similarity(s, party_name) >= 0.6:
+            return None
+    names = ", ".join(suppliers[:3]) + (" …" if len(suppliers) > 3 else "")
+    return (f"❌ Our Ledger is for **{names}**, but the Party Ledger is **{party_name}**. "
+            "These look like different parties, so almost nothing can match. "
+            "Upload the SAP ledger of this same party.")
 
 
 def _reco_period(selected_fy):
@@ -3403,6 +3489,15 @@ def _rebuild_reco_sheet_from_template(
                 particulars = row.get("Particulars", "")
                 date_value = row.get("Date")
                 amount = float(row.get("Amount", 0.0) or 0.0)
+                if str(row.get("Date Unreadable")) == "True":
+                    # The party PDF draws this date as a picture: show the known range, not a guess.
+                    lo = pd.to_datetime(date_value, errors="coerce")
+                    hi = pd.to_datetime(row.get("Date To"), errors="coerce")
+                    span = " - ".join(d.strftime("%d.%m.%Y") for d in (lo, hi) if not pd.isna(d))
+                    vch = str(row.get("Vch No.", "") or "").strip()
+                    particulars = " ".join(x for x in (str(particulars or "").strip(), vch) if x)
+                    particulars += f" (date not readable in party PDF: {span})"
+                    date_value = None
             else:
                 # RECO C/D Particulars come from SAP's Reference column.
                 particulars = row.get("Our Particulars", "")
@@ -3733,6 +3828,10 @@ def display_matching_engine(
     st.divider()
     st.header(f"🔎 Transaction Matching Engine — {selected_fy}")
 
+    wrong_party = ledger_party_mismatch(prepared_our, party_name)
+    if wrong_party:
+        st.error(wrong_party)
+
     our_match = build_our_matching_df(prepared_our, selected_fy, amount_tolerance)
     party_match = party_df_all[
         party_df_all["FY"] == selected_fy
@@ -3767,6 +3866,15 @@ def display_matching_engine(
         amount_tolerance
     )
     doc_mismatch = matched.attrs.get("doc_mismatch", pd.DataFrame())
+
+    if "Date Unreadable" in party_match.columns:
+        unreadable = int(party_match["Date Unreadable"].fillna(False).astype(bool).sum())
+        if unreadable:
+            st.warning(
+                f"⚠️ {unreadable:,} Party Ledger dates are drawn as pictures in the PDF and cannot be read. "
+                "Those entries are matched against any date between the readable dates before and after "
+                "them (column Date To). For exact dates, ask the party for an Excel or a text PDF export."
+            )
 
     total_our = len(our_match)
     total_party = len(party_match)
@@ -3831,7 +3939,7 @@ def display_matching_engine(
             st.success("All Party Ledger transactions are matched.")
         else:
             cols = [
-                "Doc No. Check", "Date", "Type", "Amount",
+                "Doc No. Check", "Date", "Date To", "Type", "Amount",
                 "Particulars", "Vch Type", "Vch No."
             ]
             st.dataframe(
