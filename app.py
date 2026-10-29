@@ -3,6 +3,8 @@ import pandas as pd
 import pdfplumber
 import io
 import re
+import threading
+import time
 from difflib import SequenceMatcher
 from copy import copy
 from pathlib import Path
@@ -1418,6 +1420,17 @@ def _transaction_amount_column_limit(profile):
     return 32.0
 
 
+def _opening_side_from_column(line_words, profile, amount):
+    """DR/CR when the opening amount sits in the Debit or Credit column, else None."""
+    if profile.get("debit_x") is None or profile.get("credit_x") is None:
+        return None
+    hits = {
+        c["column"] for c in _strict_transaction_candidates(_numeric_tokens_near_columns(line_words, profile), profile)
+        if c["column"] in ("DR", "CR") and abs(c["amount"] - amount) < 0.005
+    }
+    return hits.pop() if len(hits) == 1 else None
+
+
 def _strict_transaction_candidates(candidates, profile):
     """Keep only numeric tokens genuinely located in transaction amount columns."""
     limit = _transaction_amount_column_limit(profile)
@@ -1570,12 +1583,17 @@ def _infer_row_transaction_semantics(line_words, profile, current_date, marker_m
     }, date_value
 
 
-def _parse_pdf_page_universal(page, lines, plant_section, page_number, source_offset=0):
-    """True universal page reader (geometry + repeated-row evidence)."""
-    try:
-        words = page.extract_words(use_text_flow=True)
-    except Exception:
-        words = []
+def _parse_pdf_page_universal(page, lines, plant_section, page_number, source_offset=0, words=None):
+    """True universal page reader (geometry + repeated-row evidence).
+
+    words: the page's words with positions; read from the PDF text when not given
+    (OCR passes the words it read from the page image).
+    """
+    if words is None:
+        try:
+            words = page.extract_words(use_text_flow=True)
+        except Exception:
+            words = []
     if not words:
         return [], [], 0, 0
     grouped = _group_pdf_words_by_line(words)
@@ -1654,6 +1672,10 @@ def _parse_pdf_page_universal(page, lines, plant_section, page_number, source_of
             if nums:
                 amount = abs(_parse_signed_amount(nums[-1])[0])
                 side = _balance_side_from_line(raw)
+                if row_kind == "OPENING_BALANCE":
+                    # An opening amount printed in the Debit or Credit column is that side,
+                    # whatever Dr/Cr word the row shows (Bansal: "Cr Opening Balance" under Debit).
+                    side = _opening_side_from_column(lw, profile, amount) or side
                 if side in ("DR", "CR") and amount > 0:
                     kind = "opening" if re.search(r"\bOPENING\s+BALANCE\b", raw, re.I) else "closing"
                     if re.search(r"\b(?:DEBIT|CREDIT)\s+BALANCE\b", raw, re.I):
@@ -1862,59 +1884,287 @@ def _set_unreadable_date_windows(transactions):
         rec["Date To"] = hi
 
 
-def extract_party_pdf_transactions(uploaded_file):
-    """Universal PDF normalizer."""
-    uploaded_file.seek(0)
-    pdf_bytes = uploaded_file.read()
-    transactions = []
-    raw_pages = []
-    opening_records = []
-    closing_records = []
-    diagnostics = []
-    sections_seen = {}
+# ---------------- OCR for pages the text layer cannot read ----------------
+# Some party PDFs draw their text as shapes (Bansal: dates and whole Payment rows) or are
+# scanned images. RapidOCR reads those pages from a picture of the page and returns every
+# word with its position, so the same column parser reads them like a normal page.
+_OCR_DPI = 200
+_OCR_MAX_PAGES = 10
+_OCR_TIME_LIMIT = 150  # seconds of OCR per file: keeps READ LEDGERS inside the 300 s server limit
+_OCR_ENGINE = None
+_OCR_LOCK = threading.Lock()  # one OCR at a time: parallel runs only slow each other down
 
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        page_count = len(pdf.pages)
-        for page_number, page in enumerate(pdf.pages, 1):
-            text = page.extract_text() or ""
-            raw_lines = text.splitlines()
-            lines = [re.sub(r"\s+", " ", x).strip() for x in raw_lines]
-            raw_pages.append({"Page": page_number, "Text": text})
-            if not any(x.strip() for x in lines):
+
+def _ocr_engine():
+    """RapidOCR, loaded on first use; None when it is not installed."""
+    global _OCR_ENGINE
+    if _OCR_ENGINE is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            _OCR_ENGINE = RapidOCR()
+        except Exception:
+            _OCR_ENGINE = False
+    return _OCR_ENGINE or None
+
+
+def _page_hides_text(page, words):
+    """True when part of the page is a picture or drawn shapes the text layer cannot read."""
+    try:
+        area = float(page.width) * float(page.height)
+        big_image = any(
+            (float(i["x1"]) - float(i["x0"])) * (float(i["bottom"]) - float(i["top"])) > 0.5 * area
+            for i in page.images
+        )
+        return big_image or len(page.curves) >= 50 or (not words and bool(page.images or page.curves))
+    except Exception:
+        return False
+
+
+_OCR_GLUED_DATE_RE = re.compile(r"^(\d{1,2}[-/](?:[A-Za-z0-9]{3}|\d{1,2})[-/]\d{2,4})(\D\S*)$")
+_OCR_GLUED_SIDE_RE = re.compile(r"^(Dr|Cr)([A-Z]\S*)$")
+
+
+_OCR_DATE_MONTH_RE = re.compile(r"^(\d{1,2}[-/])([A-Za-z0-9]{3})([-/]\d{2,4})$")
+_OCR_MONTHS = {m.upper(): m for m in ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")}
+_OCR_LOOKALIKES = str.maketrans({"0": "O", "1": "L", "5": "S", "8": "B"})
+
+
+def _fix_ocr_month(token):
+    """OCR reads look-alike letters in month names as digits: "23-0ct-25" -> "23-Oct-25"."""
+    m = _OCR_DATE_MONTH_RE.match(token)
+    if not m or m.group(2).isdigit():
+        return token
+    month = _OCR_MONTHS.get(m.group(2).upper().translate(_OCR_LOOKALIKES))
+    return f"{m.group(1)}{month}{m.group(3)}" if month else token
+
+
+def _split_glued_ocr_token(token):
+    """OCR can drop the spaces after a date or a Dr/Cr marker: "23-Jan-26DrSTANDARD"."""
+    m = _OCR_GLUED_DATE_RE.match(token)
+    if m:
+        return [_fix_ocr_month(m.group(1))] + _split_glued_ocr_token(m.group(2))
+    m = _OCR_GLUED_SIDE_RE.match(token)
+    return [m.group(1), m.group(2)] if m else [_fix_ocr_month(token)]
+
+
+def _ocr_page_words(page, text_words):
+    """The page's text words plus the words OCR finds where the text layer has none.
+
+    Returns None when OCR is unavailable.
+    """
+    engine = _ocr_engine()
+    if engine is None:
+        return None
+    import numpy as np
+    from PIL import ImageDraw
+
+    scale = 72.0 / _OCR_DPI
+    left, top_offset = float(page.bbox[0]), float(page.bbox[1])
+    picture = page.to_image(resolution=_OCR_DPI).original.convert("RGB")
+    # Blank out the words the text layer already has: OCR then only reads what is
+    # drawn or scanned, which is faster and cannot misread the real text.
+    draw = ImageDraw.Draw(picture)
+    for w in text_words:
+        draw.rectangle(
+            [(float(w["x0"]) - left) / scale - 1, (float(w["top"]) - top_offset) / scale - 1,
+             (float(w["x1"]) - left) / scale + 1, (float(w["bottom"]) - top_offset) / scale + 1],
+            fill="white",
+        )
+    with _OCR_LOCK:
+        result, _ = engine(np.array(picture), use_cls=False)
+
+    # OCR boxes are a little taller than text boxes: a word on a row that also has
+    # real text takes that row's top/bottom, so both land in the same line.
+    bands = [
+        (min(float(w["top"]) for w in line), max(float(w["bottom"]) for w in line))
+        for line in _group_pdf_words_by_line(text_words)
+    ]
+
+    def covered_by_text(cx, cy):
+        return any(
+            float(w["x0"]) - 1 <= cx <= float(w["x1"]) + 1 and float(w["top"]) - 2 <= cy <= float(w["bottom"]) + 2
+            for w in text_words
+        )
+
+    words = list(text_words)
+    loose = []  # OCR words on rows without any real text
+    for box, text, _score in result or []:
+        xs = [float(p[0]) * scale + left for p in box]
+        ys = [float(p[1]) * scale + top_offset for p in box]
+        x0, x1, top, bottom = min(xs), max(xs), min(ys), max(ys)
+        cy = (top + bottom) / 2
+        band = next(((t, b) for t, b in bands if t - 2 <= cy <= b + 2), None)
+        if band:
+            top, bottom = band
+        # OCR returns phrases: split them into words, sharing the width by length.
+        tokens = [t for tok in str(text).split() for t in _split_glued_ocr_token(tok)]
+        total = sum(len(t) for t in tokens) + len(tokens) - 1
+        pos = 0
+        for tok in tokens:
+            wx0 = x0 + (x1 - x0) * pos / total
+            wx1 = x0 + (x1 - x0) * (pos + len(tok)) / total
+            pos += len(tok) + 1
+            if covered_by_text((wx0 + wx1) / 2, cy):
                 continue
+            word = {"text": tok, "x0": wx0, "x1": wx1, "top": top, "bottom": bottom, "ocr": True}
+            words.append(word)
+            if not band:
+                loose.append((cy, word))
 
-            section = _extract_pdf_section_and_balances(lines, page_number)
-            structure = _detect_pdf_page_structure(lines)
-            sections_seen.setdefault(section, {"plant_section": section, "pages": []})["pages"].append(page_number)
+    # OCR box tops on one printed row differ by a few points (letters with and without
+    # descenders): words whose centres are within 4 pt share one row.
+    row = []
+    for cy, word in sorted(loose, key=lambda x: x[0]) + [(float("inf"), None)]:
+        if row and cy - row[0][0] > 4:
+            top = min(w["top"] for _, w in row)
+            bottom = max(w["bottom"] for _, w in row)
+            for _, w in row:
+                w["top"], w["bottom"] = top, bottom
+            row = []
+        row.append((cy, word))
+    return words
 
-            page_txns, page_balances, candidate_lines, unparsed = _parse_pdf_page_universal(
-                page, lines, section, page_number
-            )
 
-            balance_seen = set()
-            for b in page_balances:
-                key = (b.get("kind"), page_number, b.get("source_row"), section)
-                if key in balance_seen:
-                    continue
-                balance_seen.add(key)
-                (opening_records if b["kind"] == "opening" else closing_records).append(b)
+def _signed_balance_record(rec):
+    amount = abs(float(rec.get("amount", 0) or 0))
+    return amount if rec.get("side") == "DR" else -amount
 
-            page_txns, implicit_balances = _infer_implicit_closing_rows(
-                page_txns, text, page_number, section
-            )
-            for b in implicit_balances:
-                closing_records.append(b)
 
-            transactions.extend(page_txns)
-            diagnostics.append({
-                "page": page_number,
-                "plant_section": section,
-                "structure": "UNIVERSAL_SEMANTIC_READER",
-                "detected_layout": structure,
-                "candidate_lines": candidate_lines,
-                "rows_loaded": len(page_txns),
-                "unparsed": unparsed,
-            })
+def check_party_balance(transactions, metadata):
+    """Opening + debits - credits must equal the closing balance printed in the PDF.
+
+    Checked per plant/section: the first opening balance printed, every transaction, and
+    the latest closing balance. status: "ok", "mismatch", or "unverified" (no closing printed).
+    """
+    opening_records = metadata.get("opening_records") or []
+    all_closings = metadata.get("closing_records") or []
+    section_of = lambda x, key: x.get(key) or "Unidentified Section"
+    printed_at = lambda r: (r.get("source_page") or 0, r.get("source_row") or 0)
+
+    def chain(name, openings, rows, closings):
+        # Later openings of a multi-year ledger repeat the previous closing: only an
+        # opening printed before the first transaction starts the chain.
+        first = min(openings, key=printed_at, default=None)
+        first_row = min(((t.get("Source Page") or 0, t.get("Source Row") or 0) for t in rows), default=None)
+        opening = (
+            _signed_balance_record(first)
+            if first and (first_row is None or printed_at(first) <= first_row) else 0.0
+        )
+        debit = sum(abs(float(t.get("Debit", 0) or 0)) for t in rows)
+        credit = sum(abs(float(t.get("Credit", 0) or 0)) for t in rows)
+        printed = sum(_signed_balance_record(r) for r in closings)
+        return {
+            "plant_section": name, "opening": opening, "debit": debit, "credit": credit,
+            "calculated_closing": opening + debit - credit, "printed_closing": printed,
+            "difference": opening + debit - credit - printed,
+        }
+
+    latest = _latest_balance_records(all_closings)
+    sections = [
+        chain(
+            section,
+            [r for r in opening_records if section_of(r, "plant_section") == section],
+            [t for t in transactions if section_of(t, "Plant/Section") == section],
+            [r for r in latest if section_of(r, "plant_section") == section],
+        )
+        for section in dict.fromkeys(section_of(r, "plant_section") for r in latest)
+    ]
+    if not sections:
+        return {"status": "unverified", "sections": [], "difference": 0.0}
+    if all(abs(s["difference"]) < 1.0 for s in sections):
+        return {"status": "ok", "sections": sections, "difference": sum(s["difference"] for s in sections)}
+
+    # The section name is read from each page's heading and can differ between pages of
+    # one ledger: check the whole ledger too, up to the last closing printed.
+    last = max(all_closings, key=printed_at)
+    whole = chain("Whole ledger", opening_records, transactions, [last])
+    status = "ok" if abs(whole["difference"]) < 1.0 else "mismatch"
+    return {"status": status, "sections": [whole], "difference": whole["difference"]}
+
+
+def party_pdf_read_messages(metadata):
+    """(kind, text) messages about OCR and the balance check of a Party Ledger PDF."""
+    messages = []
+    pages = (metadata or {}).get("ocr_pages") or []
+    if pages:
+        messages.append(("info",
+            f"🔍 Party Ledger page{'s' if len(pages) > 1 else ''} {', '.join(map(str, pages))} "
+            "read with OCR (text drawn as pictures or scanned)."))
+    if (metadata or {}).get("ocr_note"):
+        messages.append(("warning", f"⚠️ {metadata['ocr_note']}"))
+
+    check = (metadata or {}).get("balance_check") or {}
+    if check.get("status") == "ok":
+        closing = sum(s["printed_closing"] for s in check["sections"])
+        messages.append(("success",
+            f"✅ Party Ledger balance verified: opening + debits − credits = closing {balance_text(closing)}."))
+    elif check.get("status") == "mismatch":
+        s = check["sections"][0] if len(check["sections"]) == 1 else None
+        detail = (
+            f"calculated closing {balance_text(s['calculated_closing'])}, "
+            f"PDF closing {balance_text(s['printed_closing'])}, "
+            if s else ""
+        )
+        messages.append(("error",
+            f"❌ Party Ledger balance does not match: {detail}difference {format_amount(abs(check['difference']))}. "
+            "Some entries may be missing or misread. Check the Party Ledger PDF before using the RECO."))
+    return messages
+
+
+def _read_party_pdf_page(page, page_number, words=None):
+    """Transactions, balances and diagnostics of one page (words: OCR words, if any)."""
+    if words is None:
+        text = page.extract_text() or ""
+    else:
+        text = "\n".join(" ".join(str(w["text"]) for w in line) for line in _group_pdf_words_by_line(words))
+    lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines()]
+    if not any(x.strip() for x in lines):
+        return {"text": text, "section": None, "txns": [], "opening": [], "closing": [], "diag": None}
+
+    section = _extract_pdf_section_and_balances(lines, page_number)
+    structure = _detect_pdf_page_structure(lines)
+    page_txns, page_balances, candidate_lines, unparsed = _parse_pdf_page_universal(
+        page, lines, section, page_number, words=words
+    )
+
+    opening, closing = [], []
+    balance_seen = set()
+    for b in page_balances:
+        key = (b.get("kind"), page_number, b.get("source_row"), section)
+        if key in balance_seen:
+            continue
+        balance_seen.add(key)
+        (opening if b["kind"] == "opening" else closing).append(b)
+
+    page_txns, implicit_balances = _infer_implicit_closing_rows(page_txns, text, page_number, section)
+    closing.extend(implicit_balances)
+
+    diag = {
+        "page": page_number,
+        "plant_section": section,
+        "structure": "UNIVERSAL_SEMANTIC_READER",
+        "detected_layout": structure,
+        "candidate_lines": candidate_lines,
+        "rows_loaded": len(page_txns),
+        "unparsed": unparsed,
+    }
+    return {"text": text, "section": section, "txns": page_txns,
+            "opening": opening, "closing": closing, "diag": diag}
+
+
+def _assemble_party_pdf(page_results):
+    """Transactions + metadata from the per-page results (in page order)."""
+    transactions, opening_records, closing_records, diagnostics = [], [], [], []
+    sections_seen = {}
+    for page_number, res in page_results:
+        if res["section"] is None:
+            continue
+        sections_seen.setdefault(res["section"], {"plant_section": res["section"], "pages": []})["pages"].append(page_number)
+        transactions.extend(res["txns"])
+        opening_records.extend(res["opening"])
+        closing_records.extend(res["closing"])
+        diagnostics.append(res["diag"])
 
     transactions = _dedupe_party_transactions(transactions)
     _set_unreadable_date_windows(transactions)
@@ -1939,6 +2189,88 @@ def extract_party_pdf_transactions(uploaded_file):
         int(d.get("candidate_lines", 0) or 0) > 0 and int(d.get("rows_loaded", 0) or 0) == 0
         for d in diagnostics
     )
+    return transactions, metadata
+
+
+def extract_party_pdf_transactions(uploaded_file):
+    """Universal PDF normalizer.
+
+    1. Read every page from the PDF text.
+    2. Check opening + debits - credits = closing.
+    3. When that fails (or a page has no text), read the pages that hide text in
+       pictures or drawn shapes again with OCR, and keep the OCR result when it
+       balances (or when the text layer gave nothing).
+    """
+    uploaded_file.seek(0)
+    pdf_bytes = uploaded_file.read()
+    raw_pages = []
+    ocr_pages = []
+    ocr_note = None
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        page_count = len(pdf.pages)
+        results, text_words, hides_text = [], {}, []
+        for page_number, page in enumerate(pdf.pages, 1):
+            try:
+                words = page.extract_words(use_text_flow=True)
+            except Exception:
+                words = []
+            text_words[page_number] = words
+            if _page_hides_text(page, words):
+                hides_text.append(page_number)
+            res = _read_party_pdf_page(page, page_number)
+            results.append((page_number, res))
+            raw_pages.append({"Page": page_number, "Text": res["text"]})
+
+        transactions, metadata = _assemble_party_pdf(results)
+        check = check_party_balance(transactions, metadata)
+        no_text = [n for n in hides_text if not text_words[n]]
+        # OCR is slow (seconds per page), so only when the text layer clearly missed
+        # something: a page without text, a balance that does not add up, or dates drawn
+        # as pictures in a ledger without a closing balance to check against.
+        unreadable_dates = any(t.get("Date Unreadable") for t in transactions)
+        needs_ocr = bool(no_text) or check["status"] == "mismatch" or (
+            check["status"] == "unverified" and unreadable_dates
+        )
+
+        if hides_text and needs_ocr:
+            if _ocr_engine() is None:
+                ocr_note = "OCR is not installed on this server, so pages drawn as pictures could not be read."
+            else:
+                todo = []
+                started = time.monotonic()
+                ocr_results = list(results)
+                for i, (page_number, _res) in enumerate(ocr_results):
+                    if page_number not in hides_text[:_OCR_MAX_PAGES]:
+                        continue
+                    if time.monotonic() - started > _OCR_TIME_LIMIT:
+                        break
+                    page = pdf.pages[page_number - 1]
+                    words = _ocr_page_words(page, text_words[page_number])
+                    ocr_results[i] = (page_number, _read_party_pdf_page(page, page_number, words=words))
+                    todo.append(page_number)
+                ocr_txns, ocr_meta = _assemble_party_pdf(ocr_results)
+                ocr_check = check_party_balance(ocr_txns, ocr_meta)
+                better = (
+                    ocr_check["status"] == "ok"
+                    or (not transactions and ocr_txns)
+                    or (check["status"] == "mismatch" and ocr_check["status"] == "mismatch"
+                        and abs(ocr_check["difference"]) < abs(check["difference"]))
+                    or (check["status"] == "unverified" and len(ocr_txns) >= len(transactions)
+                        and not any(t.get("Date Unreadable") for t in ocr_txns))
+                )
+                if better:
+                    transactions, metadata, check, results = ocr_txns, ocr_meta, ocr_check, ocr_results
+                    ocr_pages = todo
+                    for page_number, res in results:
+                        raw_pages[page_number - 1]["Text"] = res["text"]
+                if len(todo) < len(hides_text):
+                    ocr_note = (f"Only {len(todo)} of {len(hides_text)} picture pages were read with OCR "
+                                "(time limit); check the other pages by hand.")
+
+    metadata["balance_check"] = check
+    metadata["ocr_pages"] = ocr_pages
+    metadata["ocr_note"] = ocr_note
     return transactions, raw_pages, page_count, metadata
 
 
@@ -4236,6 +4568,8 @@ if st.button("▶️ READ LEDGERS", type="primary"):
                 )
             else:
                 st.success("✅ Universal Party Ledger normalized successfully.")
+            for kind, text in party_pdf_read_messages(party_metadata):
+                getattr(st, kind)(text)
         else:
             st.session_state["ledgers_loaded"] = False
 

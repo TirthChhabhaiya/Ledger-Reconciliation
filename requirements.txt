@@ -5,6 +5,9 @@ fastapi==0.115.6
 starlette==0.41.3
 python-multipart==0.0.20
 uvicorn==0.32.1
+# `npm start` auto-reload: watches file events and skips .venv. Without it uvicorn polls
+# every .py file in .venv several times a second, which keeps a CPU core busy.
+watchfiles==1.3.0
 numpy==2.1.3
 pandas==2.2.3
 pdfplumber==0.11.4
@@ -13,3 +16,6 @@ xlrd==2.0.1
 # Highlighted ledgers (highlight_export.py): yellow boxes drawn onto the original PDF.
 pypdf==6.21.2
 reportlab==5.1.0
+# OCR for Party Ledger PDF pages drawn as pictures or scanned (app.py _ocr_page_words).
+rapidocr-onnxruntime==1.4.4
+onnxruntime==1.31.1

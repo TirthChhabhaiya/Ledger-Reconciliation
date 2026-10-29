@@ -192,6 +192,8 @@ def _read_ledgers(our_file, party_file, ui):
             )
         else:
             ui.success("✅ Universal Party Ledger normalized successfully.")
+        for kind, text in engine.party_pdf_read_messages(party_metadata):
+            getattr(ui, kind)(text)
     else:
         state["ledgers_loaded"] = False
 
